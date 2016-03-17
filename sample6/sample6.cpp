@@ -231,6 +231,7 @@ struct BobaOptixLoader
   {
     _geometryGroup = context->createGeometryGroup();
     unordered_map<int, optix::Material> materials;
+    unordered_map<int, protocol::MaterialBlob*> materialBlobsById;
 
     Program prgClosestHit = context->createProgramFromPTXFile(mtlPath, "closest_hit_radiance");
     Program prgAnyHit = context->createProgramFromPTXFile(mtlPath, "any_hit_shadow");
@@ -244,17 +245,8 @@ struct BobaOptixLoader
       optix::Material mtl = context->createMaterial();
       mtl->setClosestHitProgram(0u, prgClosestHit);
       mtl->setAnyHitProgram(1u, prgAnyHit);
-
       materials[materialBlob->materialId] = mtl;
-
-      if (materialBlob->materialId != ~0)
-      {
-        for (int i = 0; i < materialBlob->components->numElems; ++i)
-        {
-          protocol::MaterialBlob::MaterialComponent* c = &materialBlob->components->elems[i];
-          // TODO(magnus): set properties based on components
-        }
-      }
+      materialBlobsById[materialBlob->materialId] = materialBlob;
     }
 
     for (protocol::MeshBlob* meshBlob : loader.meshes)
@@ -298,7 +290,7 @@ struct BobaOptixLoader
 
         // TODO(magnus): this is just a hack to always use the default material
         // optix::Material mat = materials[group->materialId];
-        optix::Material mat = materials[~0];
+        optix::Material mat = materials[group->materialId];
 
         optix::Geometry geo = context->createGeometry();
         geo->setPrimitiveCount(numTriangles);
@@ -385,13 +377,30 @@ struct BobaOptixLoader
 
         GeometryInstance instance = context->createGeometryInstance(geo, &mat, &mat + 1);
 
-        // TODO(magnus): apply proper material settings
-        float zero[3] = {1, 1, 1};
+        float zero[3] = { 1, 1, 1 };
         float3 Kd = *(float3*)zero;
         float3 Ka = *(float3*)zero;
         float3 Ks = *(float3*)zero;
 
-        instance["emissive"]->setFloat(1);
+        instance["emissive"]->setFloat(0);
+
+        if (group->materialId != ~0)
+        {
+          protocol::MaterialBlob* materialBlob = materialBlobsById[group->materialId];
+          for (int i = 0; i < materialBlob->components->numElems; ++i)
+          {
+            protocol::MaterialBlob::MaterialComponent* c = &materialBlob->components->elems[i];
+            if (strcmp(c->name, "color") == 0)
+            {
+              memcpy((void*)&Kd, &c->r, sizeof(Kd));
+            }
+            else if (strcmp(c->name, "lumi") == 0)
+            {
+              instance["emissive"]->setFloat(1);
+            }
+          }
+        }
+
         instance["reflectivity"]->setFloat(0);
         instance["phong_exp"]->setFloat(0);
         instance["illum"]->setInt(0);
@@ -487,7 +496,7 @@ void MeshViewer::initContext()
     m_context["accum_buffer"]->set(m_accum_buffer);
     resetAccumulation();
   }
-  // const std::string camera_file = "pinhole_camera.cu";
+
   const std::string camera_ptx = ptxpath("sample6", camera_file);
   Program ray_gen_program = m_context->createProgramFromPTXFile(camera_ptx, camera_name);
   m_context->setRayGenerationProgram(0, ray_gen_program);
@@ -667,7 +676,7 @@ void MeshViewer::resetAccumulation()
   m_frame = 0;
   m_context["frame"]->setInt(m_frame);
   m_context["sqrt_occlusion_samples"]->setInt(1 * m_ao_sample_mult);
-  m_context["sqrt_diffuse_samples"]->setInt(1);
+  m_context["sqrt_diffuse_samples"]->setInt(2);
 }
 
 void MeshViewer::genRndSeeds(unsigned int width, unsigned int height)
@@ -697,7 +706,7 @@ int main(int argc, char** argv)
 
   GLUTDisplay::contDraw_E draw_mode = GLUTDisplay::CDNone;
   MeshViewer scene;
-  scene.setMesh("c:/onedrive/tokko/gfx/sh_test1.boba");
+  scene.setMesh("d:/onedrive/tokko/gfx/sh_test1.boba");
   // scene.setMesh("c:/onedrive/tokko/gfx/deform_sphere.boba");
 
   try

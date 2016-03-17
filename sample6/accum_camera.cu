@@ -95,40 +95,6 @@ RT_PROGRAM void pinhole_camera()
 #endif
 }
 
-
-RT_PROGRAM void orthographic_camera()
-{
-  size_t2 screen = output_buffer.size();
-
-  // Subpixel jitter: send the ray through a different position inside the pixel each time,
-  // to provide antialiasing.
-  unsigned int seed = rot_seed( rnd_seeds[ launch_index ], frame );
-  float2 subpixel_jitter = make_float2(rnd( seed ) - 0.5f, rnd( seed ) - 0.5f) * jitter_factor;
-
-  float2 d = (make_float2(launch_index) + subpixel_jitter)
-      / make_float2(screen) * 2.f - 1.f;                                   // film coords
-  float3 ray_origin    = eye + d.x*U + d.y*V;                              // eye + offset in film space
-  float3 ray_direction = W;                                                // always parallel view direction
-
-  optix::Ray ray = optix::make_Ray(ray_origin, ray_direction, radiance_ray_type, scene_epsilon, RT_DEFAULT_MAX);
-
-  PerRayData_radiance prd;
-  prd.importance = 1.f;
-  prd.depth = 0;
-
-  rtTrace(top_object, ray, prd);
-
-  float4 acc_val = accum_buffer[launch_index];
-  if( frame > 0 )
-    acc_val += make_float4(prd.result, 0.f);
-  else
-    acc_val = make_float4(prd.result, 0.f);
-  output_buffer[launch_index] = make_color( make_float3(acc_val) * (1.0f/float(frame+1)) );
-  accum_buffer[launch_index] = acc_val;
-}
-
-
-
 RT_PROGRAM void exception()
 {
   output_buffer[launch_index] = make_color( bad_color );
