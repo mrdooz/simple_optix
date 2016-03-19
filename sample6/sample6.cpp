@@ -26,6 +26,9 @@
 
   I did this after looking over the existing Mesh/OptixMesh code, and just feeling that it
   was way to spread out for me to actually grok what was going on.
+
+  NB: This sample uses the one_bounce_diffuse program, so various bits and pieces that aren't
+  needed for this have been ripped out.
 */
 
 #include "MeshScene.h"
@@ -57,6 +60,13 @@ typedef uint32_t u32;
 
 #include "boba_scene_format.hpp"
 
+enum RayTypes
+{
+  RT_Radiance,
+  RT_Shadow,
+  RT_COUNT,
+};
+
 //------------------------------------------------------------------------------
 //
 // MeshViewer class
@@ -76,7 +86,6 @@ struct MeshViewer : public MeshScene
 
   void initContext();
   void initLights();
-  // void initMaterial();
   void initGeometry();
   void initCamera(InitialCameraData& cam_data);
   void preprocess();
@@ -86,10 +95,6 @@ struct MeshViewer : public MeshScene
   bool Load(const char* filename);
   void ProcessFixups(u32 fixupOffset);
 
-  bool m_accum_enabled = true;
-  bool m_aa_enabled;
-  float m_ao_radius;
-  int m_ao_sample_mult;
   float m_light_scale;
 
   Aabb m_aabb;
@@ -98,9 +103,6 @@ struct MeshViewer : public MeshScene
 
   float m_scene_epsilon;
   int m_frame;
-  bool m_animation;
-
-  bool m_merge_mesh_groups;
 
   vector<protocol::MeshBlob*> meshes;
   vector<protocol::NullObjectBlob*> nullObjects;
@@ -164,8 +166,12 @@ bool MeshViewer::Load(const char* filename)
   for (u32 i = 0; i < scene->numMeshes; ++i, ++meshBlobs)
   {
     protocol::MeshBlob* meshBlob = *meshBlobs;
-    fnAddBlob(meshBlob);
-    meshes.push_back(meshBlob);
+    // HACK(magnus): skip main cube for now
+    //if (strcmp(meshBlob->name, "Cube") != 0)
+    {
+      fnAddBlob(meshBlob);
+      meshes.push_back(meshBlob);
+    }
   }
 
   // add lights
@@ -227,6 +233,28 @@ struct BobaOptixLoader
   optix::Aabb _aabb;
   optix::GeometryGroup _geometryGroup;
 
+  optix::Matrix4x4 xformMatrixFromBlob(const protocol::BlobBase* blob)
+  {
+    float tx = blob->xformGlobal.pos[0];
+    float ty = blob->xformGlobal.pos[1];
+    float tz = blob->xformGlobal.pos[2];
+
+    float rx = blob->xformGlobal.rot[0];
+    float ry = blob->xformGlobal.rot[1];
+    float rz = blob->xformGlobal.rot[2];
+
+    float sx = blob->xformGlobal.scale[0];
+    float sy = blob->xformGlobal.scale[1];
+    float sz = blob->xformGlobal.scale[2];
+
+    return
+      optix::Matrix4x4::rotate(rx, make_float3(1, 0, 0)) *
+      optix::Matrix4x4::rotate(ry, make_float3(0, 1, 0)) *
+      optix::Matrix4x4::rotate(rz, make_float3(0, 0, 1)) *
+      optix::Matrix4x4::scale(make_float3(sx, sy, sz)) *
+      optix::Matrix4x4::translate(make_float3(tx, ty, tz));
+  }
+
   void Load(const MeshViewer& loader, optix::Context& context, const string& mtlPath, const string& prgPath)
   {
     _geometryGroup = context->createGeometryGroup();
@@ -241,10 +269,9 @@ struct BobaOptixLoader
 
     for (protocol::MaterialBlob* materialBlob : loader.materials)
     {
-      // TODO(magnus): enum for ray types
       optix::Material mtl = context->createMaterial();
-      mtl->setClosestHitProgram(0u, prgClosestHit);
-      mtl->setAnyHitProgram(1u, prgAnyHit);
+      mtl->setClosestHitProgram(RT_Radiance, prgClosestHit);
+      mtl->setAnyHitProgram(RT_Shadow, prgAnyHit);
       materials[materialBlob->materialId] = mtl;
       materialBlobsById[materialBlob->materialId] = materialBlob;
     }
@@ -266,6 +293,11 @@ struct BobaOptixLoader
         if (strcmp(ds->name, "index32") == 0)
         {
           numTriangles = ds->dataSize / (3 * sizeof(int));
+          int* tris = (int*)ds->data;
+          for (int j = 0; j < numTriangles; ++j)
+          {
+            swap(tris[j*3+0], tris[j*3+2]);
+          }
           indexStream = ds;
         }
         else if (strcmp(ds->name, "pos") == 0)
@@ -288,8 +320,6 @@ struct BobaOptixLoader
       {
         protocol::MeshBlob::MaterialGroup* group = &meshBlob->materialGroups->elems[i];
 
-        // TODO(magnus): this is just a hack to always use the default material
-        // optix::Material mat = materials[group->materialId];
         optix::Material mat = materials[group->materialId];
 
         optix::Geometry geo = context->createGeometry();
@@ -319,7 +349,7 @@ struct BobaOptixLoader
           float3* src = (float3*)posStream->data;
           float3* dst = (float3*)vBuffer->map();
 
-          optix::Matrix4x4 mtx = optix::Matrix4x4::translate(*(float3*)&meshBlob->xformGlobal.pos[0]);
+          optix::Matrix4x4 mtx = xformMatrixFromBlob(meshBlob);
 
           for (int i = 0; i < numVertices; ++i)
           {
@@ -342,9 +372,8 @@ struct BobaOptixLoader
           float3* src = (float3*)normalStream->data;
           float3* dst = (float3*)nBuffer->map();
 
-          optix::Matrix4x4 mtx = optix::Matrix4x4::translate(*(float3*)&meshBlob->xformGlobal.pos[0]);
+          optix::Matrix4x4 mtx = xformMatrixFromBlob(meshBlob);
           mtx = mtx.inverse().transpose();
-
           for (int i = 0; i < numVertices; ++i)
           {
             dst[i] = make_float3(mtx * make_float4(src[i], 0.0f));
@@ -377,12 +406,11 @@ struct BobaOptixLoader
 
         GeometryInstance instance = context->createGeometryInstance(geo, &mat, &mat + 1);
 
-        float zero[3] = { 1, 1, 1 };
-        float3 Kd = *(float3*)zero;
-        float3 Ka = *(float3*)zero;
-        float3 Ks = *(float3*)zero;
-
-        instance["emissive"]->setFloat(0);
+        float3 zero = { 0, 0, 0 };
+        float3 diffuse = zero;
+        float3 ambient = zero;
+        float3 specular = zero;
+        float3 emissive = zero;
 
         if (group->materialId != ~0)
         {
@@ -392,22 +420,20 @@ struct BobaOptixLoader
             protocol::MaterialBlob::MaterialComponent* c = &materialBlob->components->elems[i];
             if (strcmp(c->name, "color") == 0)
             {
-              memcpy((void*)&Kd, &c->r, sizeof(Kd));
+              diffuse = make_float3(c->r, c->g, c->b);
             }
             else if (strcmp(c->name, "lumi") == 0)
             {
-              instance["emissive"]->setFloat(1);
+              float s = 1;
+              emissive = make_float3(s * c->r, s * c->g, s * c->b);
             }
           }
         }
 
-        instance["reflectivity"]->setFloat(0);
-        instance["phong_exp"]->setFloat(0);
-        instance["illum"]->setInt(0);
-
-        instance["ambient_map"]->setTextureSampler(loadTexture(context, "", Ka));
-        instance["diffuse_map"]->setTextureSampler(loadTexture(context, "", Kd));
-        instance["specular_map"]->setTextureSampler(loadTexture(context, "", Ks));
+        instance["ambient_map"]->setTextureSampler(loadTexture(context, "", ambient));
+        instance["diffuse_map"]->setTextureSampler(loadTexture(context, "", diffuse));
+        instance["specular_map"]->setTextureSampler(loadTexture(context, "", specular));
+        instance["emissive_map"]->setTextureSampler(loadTexture(context, "", emissive));
 
         _geometryGroup->addChild(instance);
       }
@@ -433,51 +459,36 @@ struct BobaOptixLoader
   }
 };
 
-
 //------------------------------------------------------------------------------
-//
-// MeshViewer implementation
-//
-//------------------------------------------------------------------------------
-
 MeshViewer::MeshViewer()
-    : m_aa_enabled(false)
-    , m_ao_radius(1.0f)
-    , m_ao_sample_mult(1)
-    , m_light_scale(1.0f)
+    : m_light_scale(1.0f)
     , m_scene_epsilon(1e-4f)
     , m_frame(0)
-    , m_animation(false)
-    , m_merge_mesh_groups(true)
 {
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::initScene(InitialCameraData& camera_data)
 {
   initContext();
   initLights();
 
-  if (m_accum_enabled)
-  {
-    genRndSeeds(getImageWidth(), getImageHeight());
-  }
+  genRndSeeds(getImageWidth(), getImageHeight());
 
   initGeometry();
   initCamera(camera_data);
   preprocess();
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::initContext()
 {
-  m_context->setRayTypeCount(3);
+  m_context->setRayTypeCount(RT_COUNT);
   m_context->setEntryPointCount(1);
-  m_context->setStackSize(1180);
+  m_context->setStackSize(4096);
 
-  m_context["radiance_ray_type"]->setUint(0u);
-  m_context["shadow_ray_type"]->setUint(1u);
-  m_context["max_depth"]->setInt(5);
-  m_context["ambient_light_color"]->setFloat(0.2f, 0.2f, 0.2f);
-  m_context["jitter_factor"]->setFloat(m_aa_enabled ? 1.0f : 0.0f);
+  m_context["radiance_ray_type"]->setUint(RT_Radiance);
+  m_context["shadow_ray_type"]->setUint(RT_Shadow);
 
   const unsigned int width = getImageWidth();
   const unsigned int height = getImageHeight();
@@ -485,17 +496,13 @@ void MeshViewer::initContext()
 
   // Ray generation program setup
   const std::string camera_name = "pinhole_camera";
+  const std::string camera_file = "accum_camera.cu";
 
-  const std::string camera_file = m_accum_enabled ? "accum_camera.cu" : "pinhole_camera.cu";
-
-  if (m_accum_enabled)
-  {
-    // The raygen program needs accum_buffer
-    m_accum_buffer = m_context->createBuffer(
-        RT_BUFFER_INPUT_OUTPUT | RT_BUFFER_GPU_LOCAL, RT_FORMAT_FLOAT4, width, height);
-    m_context["accum_buffer"]->set(m_accum_buffer);
-    resetAccumulation();
-  }
+  // The raygen program needs accum_buffer
+  m_accum_buffer = m_context->createBuffer(
+    RT_BUFFER_INPUT_OUTPUT | RT_BUFFER_GPU_LOCAL, RT_FORMAT_FLOAT4, width, height);
+  m_context["accum_buffer"]->set(m_accum_buffer);
+  resetAccumulation();
 
   const std::string camera_ptx = ptxpath("sample6", camera_file);
   Program ray_gen_program = m_context->createProgramFromPTXFile(camera_ptx, camera_name);
@@ -512,6 +519,7 @@ void MeshViewer::initContext()
   m_context["bg_color"]->setFloat(0.34f, 0.55f, 0.85f);
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::initLights()
 {
   // Lights buffer
@@ -530,6 +538,7 @@ void MeshViewer::initLights()
   m_context["lights"]->set(light_buffer);
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::initGeometry()
 {
   double start, end;
@@ -551,11 +560,11 @@ void MeshViewer::initGeometry()
   m_context["top_shadower"]->set(m_geometry_group);
 
   sutilCurrentTime(&end);
-  // std::cerr << "Triangles:" << loader.getNumTriangles() << std::endl;
   std::cerr << "Time to load " << (m_accel_desc.large_mesh ? "and cluster " : "")
             << "geometry: " << end - start << " s.\n";
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::initCamera(InitialCameraData& camera_data)
 {
   // Set up camera
@@ -588,12 +597,12 @@ void MeshViewer::initCamera(InitialCameraData& camera_data)
   m_context["W"]->setFloat(make_float3(0.0f, 0.0f, 0.0f));
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::preprocess()
 {
   // Settings which rely on previous initialization
   m_scene_epsilon = 1.e-4f * m_aabb.maxExtent();
   m_context["scene_epsilon"]->setFloat(m_scene_epsilon);
-  m_context["occlusion_distance"]->setFloat(m_aabb.maxExtent() * 0.3f * m_ao_radius);
 
   // Prepare to run
   try
@@ -617,6 +626,7 @@ void MeshViewer::preprocess()
   saveAccelCache();
 }
 
+//------------------------------------------------------------------------------
 bool MeshViewer::keyPressed(unsigned char key, int x, int y)
 {
   switch (key)
@@ -635,18 +645,17 @@ bool MeshViewer::keyPressed(unsigned char key, int x, int y)
   return false;
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::doResize(unsigned int width, unsigned int height)
 {
   // output_buffer resizing handled in base class
-  if (m_accum_enabled)
-  {
-    m_accum_buffer->setSize(width, height);
-    m_rnd_seeds->setSize(width, height);
-    genRndSeeds(width, height);
-    resetAccumulation();
-  }
+  m_accum_buffer->setSize(width, height);
+  m_rnd_seeds->setSize(width, height);
+  genRndSeeds(width, height);
+  resetAccumulation();
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::trace(const RayGenCameraData& camera_data)
 {
   m_context["eye"]->setFloat(camera_data.eye);
@@ -661,24 +670,28 @@ void MeshViewer::trace(const RayGenCameraData& camera_data)
   m_context->launch(0, static_cast<unsigned int>(buffer_width), static_cast<unsigned int>(buffer_height));
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::cleanUp()
 {
   SampleScene::cleanUp();
 }
 
+//------------------------------------------------------------------------------
 Buffer MeshViewer::getOutputBuffer()
 {
   return m_context["output_buffer"]->getBuffer();
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::resetAccumulation()
 {
   m_frame = 0;
   m_context["frame"]->setInt(m_frame);
-  m_context["sqrt_occlusion_samples"]->setInt(1 * m_ao_sample_mult);
-  m_context["sqrt_diffuse_samples"]->setInt(2);
+  m_context["max_bounces"]->setInt(1);
+  m_context["sqrt_diffuse_samples"]->setInt(8);
 }
 
+//------------------------------------------------------------------------------
 void MeshViewer::genRndSeeds(unsigned int width, unsigned int height)
 {
   // Init random number buffer if necessary.
@@ -694,20 +707,22 @@ void MeshViewer::genRndSeeds(unsigned int width, unsigned int height)
   m_rnd_seeds->unmap();
 }
 
-//-----------------------------------------------------------------------------
-//
-// Main driver
-//
-//-----------------------------------------------------------------------------
-
+//------------------------------------------------------------------------------
 int main(int argc, char** argv)
 {
   GLUTDisplay::init(argc, argv);
 
   GLUTDisplay::contDraw_E draw_mode = GLUTDisplay::CDNone;
   MeshViewer scene;
-  scene.setMesh("d:/onedrive/tokko/gfx/sh_test1.boba");
-  // scene.setMesh("c:/onedrive/tokko/gfx/deform_sphere.boba");
+
+  // production quality :)
+  string meshName = "d:/onedrive/tokko/gfx/sh_test1.boba";
+  FILE* f = fopen(meshName.c_str(), "rb");
+  if (f)
+    fclose(f);
+  else
+    meshName[0] = 'c';
+  scene.setMesh(meshName.c_str());
 
   try
   {

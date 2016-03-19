@@ -24,7 +24,8 @@
 #include "commonStructs.h"
 #include "random.h"
 
-rtTextureSampler<float4, 2>   diffuse_map;         
+rtTextureSampler<float4, 2>   diffuse_map;
+rtTextureSampler<float4, 2>   emissive_map;
 rtBuffer<unsigned int, 2>     rnd_seeds;
 
 rtDeclareVariable(int, sqrt_diffuse_samples, ,);
@@ -47,6 +48,7 @@ struct PerRayData_shadow
 
 rtBuffer<BasicLight>                 lights;
 rtDeclareVariable(int,               frame, , );
+rtDeclareVariable(int,               max_bounces, , );
 rtDeclareVariable(unsigned int,      radiance_ray_type, , );
 rtDeclareVariable(unsigned int,      shadow_ray_type, , );
 rtDeclareVariable(float,             scene_epsilon, , );
@@ -69,10 +71,11 @@ RT_PROGRAM void closest_hit_radiance()
   float2 uv                     = make_float2(texcoord);
 
   float3 Kd = make_float3(tex2D(diffuse_map, uv.x, uv.y));
+  float3 emissive = make_float3(tex2D(emissive_map, uv.x, uv.y));
   float3 result = make_float3(0);
 
   // Compute indirect bounce
-  if(prd.depth < 1) {
+  if(prd.depth < max_bounces) {
     optix::Onb onb(ffnormal);
     unsigned int seed = rot_seed( rnd_seeds[ launch_index ], frame );
     const float inv_sqrt_samples = 1.0f / float(sqrt_diffuse_samples);
@@ -105,28 +108,30 @@ RT_PROGRAM void closest_hit_radiance()
     result *= (Kd)/((float)(M_PIf*sqrt_diffuse_samples*sqrt_diffuse_samples));
   }
 
+  result += emissive;
+
   // Compute direct lighting
-  int num_lights = lights.size();
-  while(num_lights--) {
-    const BasicLight& light = lights[num_lights];
-    float3 L = light.pos - hit_point;
-    float Ldist = length(light.pos - hit_point);
-    L /= Ldist;
-    float nDl = dot( ffnormal, L);
+  //int num_lights = lights.size();
+  //while(num_lights--) {
+  //  const BasicLight& light = lights[num_lights];
+  //  float3 L = light.pos - hit_point;
+  //  float Ldist = length(light.pos - hit_point);
+  //  L /= Ldist;
+  //  float nDl = dot( ffnormal, L);
 
-    if(nDl > 0.f) {
-      if(light.casts_shadow) {
-        PerRayData_shadow shadow_prd;
-        shadow_prd.attenuation = make_float3(1.f);
-        optix::Ray shadow_ray = optix::make_Ray( hit_point, L, shadow_ray_type, scene_epsilon, Ldist );
-        rtTrace(top_shadower, shadow_ray, shadow_prd);
+  //  if(nDl > 0.f) {
+  //    if(light.casts_shadow) {
+  //      PerRayData_shadow shadow_prd;
+  //      shadow_prd.attenuation = make_float3(1.f);
+  //      optix::Ray shadow_ray = optix::make_Ray( hit_point, L, shadow_ray_type, scene_epsilon, Ldist );
+  //      rtTrace(top_shadower, shadow_ray, shadow_prd);
 
-        if(fmaxf(shadow_prd.attenuation) > 0.f) {
-          result += Kd * nDl * light.color * shadow_prd.attenuation;
-        }
-      }
-    }
-  }
+  //      if(fmaxf(shadow_prd.attenuation) > 0.f) {
+  //        result += Kd * nDl * light.color * shadow_prd.attenuation;
+  //      }
+  //    }
+  //  }
+  //}
 
   prd.result = result;
 }

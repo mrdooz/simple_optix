@@ -29,14 +29,11 @@ if(GLUT_FOUND AND OPENGL_FOUND)
 
     # These files are common among multiple samples
     accum_camera.cu
-    ambocc.cu
     commonStructs.h
     constantbg.cu
     helpers.h
     normal_shader.cu
     one_bounce_diffuse.cu
-    orthographic_camera.cu
-    parallelogram.cu
     pinhole_camera.cu
     triangle_mesh.cu
     random.h
